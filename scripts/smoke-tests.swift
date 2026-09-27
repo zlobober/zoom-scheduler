@@ -43,11 +43,28 @@ struct SmokeTests {
         END:VEVENT
         END:VCALENDAR
         """
+        let invitation = "Topic: Example\nJoin Zoom Meeting\nhttps://example.zoom.us/j/12345"
+        let direct = try matchingInvitation(in: [invitation, invitation, "Join Zoom Meeting"], topic: "Example")
+        precondition(direct == invitation)
+        let wrongTopic = try matchingInvitation(in: [invitation], topic: "Different")
+        precondition(wrongTopic == nil)
+        let maliciousURL = try matchingInvitation(in: ["Example https://zoom.us.evil.example/j/12345"], topic: "Example")
+        precondition(maliciousURL == nil)
+        let emptyTopic = try matchingInvitation(in: [invitation], topic: " ")
+        precondition(emptyTopic == nil)
+        var ambiguousText = false
+        do { _ = try matchingInvitation(in: [invitation, invitation.replacingOccurrences(of: "12345", with: "67890")], topic: "Example") }
+        catch { ambiguousText = true }
+        precondition(ambiguousText)
         let parsed = CalendarInvitation.parse(ics)!
         precondition(parsed.topic == "Example, test")
         precondition(parsed.text == "Join\nhttps://example.zoom.us/j/12345\nEnd")
         precondition(CalendarInvitation.parse(ics.replacingOccurrences(of: "https://example.zoom.us", with: "https://example.com")) == nil)
         precondition(CalendarInvitation.parse(ics + "\n" + ics) == nil)
+        let recurring = CalendarInvitation.parse(ics.replacingOccurrences(of: "UID:example-id", with: "UID:example-id\nRRULE:FREQ=WEEKLY;BYDAY=FR"))!
+        precondition(recurring.recurrenceRule == "FREQ=WEEKLY;BYDAY=FR")
+        precondition(recurring.message.contains("Repeat (iCalendar): FREQ=WEEKLY;BYDAY=FR"))
+        precondition(parsed.recurrenceRule == nil)
         let utc = CalendarInvitation.parse(ics.replacingOccurrences(of: "DTSTART;TZID=Europe/Brussels:20300315T143000", with: "DTSTART:20300315T133000Z"))!
         precondition(utc.start == parsed.start)
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -69,6 +86,29 @@ struct SmokeTests {
         precondition(retrieval.invitationOnly && retrieval.start == nil)
         let timed = try CLIOptions(arguments: ["--topic", "Two hours", "--at", "2030-03-15T14:30:00+01:00", "--duration-minutes", "120"])
         precondition(timed.durationMinutes == 120)
+        for rule in Recurrence.allCases {
+            let options = try CLIOptions(arguments: ["--topic", "Repeating test", "--at", "2030-03-15T14:30:00+01:00", "--repeat", rule.rawValue])
+            precondition(options.recurrence == rule)
+        }
+        precondition(cli.recurrence == .none)
+        let bounded = try CLIOptions(arguments: ["--topic", "Every four weeks", "--at", "2030-03-15T14:30:00+01:00", "--repeat", "weekly", "--repeat-every", "4", "--repeat-until", "2030-12-31"])
+        precondition(bounded.repeatEvery == 4 && bounded.repeatUntil != nil)
+        precondition(Recurrence.dateString(bounded.repeatUntil!) == "2030-12-31")
+        precondition(Recurrence.weekly.requestID(every: 1, until: nil) == "weekly")
+        precondition(Recurrence.weekly.requestID(every: 4, until: bounded.repeatUntil) == "weekly|4|2030-12-31")
+        let sameDate = Calendar.current.startOfDay(for: date)
+        try Recurrence.weekly.validate(start: date, every: 2, until: sameDate)
+        let leapDate = try Recurrence.parseEndDate("2032-02-29")
+        precondition(Recurrence.dateString(leapDate) == "2032-02-29")
+        var formats = Configuration()
+        formats.timeFormat = "HH:mm"
+        precondition(Recurrence.weekly.zoomLabel(start: date, config: formats) == "Weekly on Friday")
+        precondition(Recurrence.daily.zoomLabel(start: date, config: formats) == "Daily at 14:30")
+        precondition(Recurrence.weekdays.zoomLabel(start: date, config: formats) == "Every weekday (Monday to Friday)")
+        for (day, suffix) in [(1,"st"), (2,"nd"), (3,"rd"), (11,"th"), (12,"th"), (13,"th"), (21,"st"), (22,"nd"), (23,"rd"), (31,"st")] {
+            let sample = Calendar(identifier: .gregorian).date(from: DateComponents(year:2030, month:3, day:day, hour:12))!
+            precondition(Recurrence.monthly.zoomLabel(start: sample, config: formats) == "Monthly on the \(day)\(suffix)")
+        }
         for arguments in [
             ["--cli"],
             ["--topic", "Example"],
@@ -76,6 +116,20 @@ struct SmokeTests {
             ["--topic", "Example", "--at", "invalid"],
             ["--topic"],
             ["--unknown"],
+            ["--topic", "Bad recurrence", "--at", "2030-03-15T14:30:00+01:00", "--repeat", "hourly"],
+            ["--repeat"],
+            ["--repeat-every", "0"],
+            ["--repeat-every", "100"],
+            ["--repeat-every", "two"],
+            ["--topic", "Missing rule", "--at", "2030-03-15T12:00:00Z", "--repeat-every", "2"],
+            ["--topic", "Missing rule", "--at", "2030-03-15T12:00:00Z", "--repeat-until", "2030-12-31"],
+            ["--topic", "Early end", "--at", "2030-03-15T12:00:00Z", "--repeat", "weekly", "--repeat-until", "2030-03-14"],
+            ["--topic", "Invalid end", "--at", "2030-03-15T12:00:00Z", "--repeat", "weekly", "--repeat-until", "2030-02-29"],
+            ["--repeat-until", "2030-2-3"],
+            ["--repeat-until", "2030-12-31T00:00:00Z"],
+            ["--invitation-only", "--topic", "Existing", "--repeat-every", "2"],
+            ["--invitation-only", "--topic", "Existing", "--repeat", "weekly"],
+            ["--topic", "Weekend", "--at", "2030-03-16T12:00:00+01:00", "--repeat", "weekdays"],
             ["--duration-minutes", "0"],
             ["--duration-minutes", "-1"],
             ["--duration-minutes", "abc"],

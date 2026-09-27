@@ -17,6 +17,18 @@ final class SchedulerModel {
     var start = (Workflow.preferences.object(forKey: "lastStart") as? Date) ?? Date().addingTimeInterval(3600) {
         didSet { Workflow.preferences.set(start, forKey: "lastStart") }
     }
+    var recurrence = Recurrence(rawValue: Workflow.preferences.string(forKey: "lastRecurrence") ?? "none") ?? .none {
+        didSet { Workflow.preferences.set(recurrence.rawValue, forKey: "lastRecurrence") }
+    }
+    var repeatEvery = max(1, Workflow.preferences.integer(forKey: "lastRepeatEvery")) {
+        didSet { Workflow.preferences.set(repeatEvery, forKey: "lastRepeatEvery") }
+    }
+    var hasRepeatEnd = Workflow.preferences.bool(forKey: "hasRepeatEnd") {
+        didSet { Workflow.preferences.set(hasRepeatEnd, forKey: "hasRepeatEnd") }
+    }
+    var repeatUntil = (Workflow.preferences.object(forKey: "lastRepeatUntil") as? Date) ?? Date().addingTimeInterval(90 * 86400) {
+        didSet { Workflow.preferences.set(repeatUntil, forKey: "lastRepeatUntil") }
+    }
     var invitation = ""
     var log = ""
     var busy = false
@@ -36,6 +48,9 @@ final class SchedulerModel {
         }
         Workflow.preferences.set(topic, forKey: "lastTopic")
         Workflow.preferences.set(start, forKey: "lastStart")
+        Workflow.preferences.set(repeatEvery, forKey: "lastRepeatEvery")
+        Workflow.preferences.set(repeatUntil, forKey: "lastRepeatUntil")
+        Workflow.preferences.set(hasRepeatEnd, forKey: "hasRepeatEnd")
         busy = true
         invitation = ""
         log = ""
@@ -43,7 +58,9 @@ final class SchedulerModel {
         task = Task { @MainActor in
             defer { busy = false; task = nil }
             do {
-                invitation = try await workflow.run(topic: topic, start: start, config: Workflow.configuration())
+                invitation = try await workflow.run(topic: topic, start: start, config: Workflow.configuration(), recurrence: recurrence,
+                                                     repeatEvery: recurrence == .none ? 1 : repeatEvery,
+                                                     repeatUntil: recurrence != .none && hasRepeatEnd ? repeatUntil : nil)
                 append("Done. Invitation is ready below.")
             } catch is CancellationError {
                 append("Stopped. Any meeting already submitted remains in Zoom.")
@@ -51,7 +68,6 @@ final class SchedulerModel {
                 append("ERROR: \(error.localizedDescription)")
                 append("If submission was attempted, repeating this same topic/time will retrieve only, not create a duplicate.")
             }
-            NSApplication.shared.activate(ignoringOtherApps: true)
         }
     }
 }
@@ -67,7 +83,22 @@ struct SchedulerView: View {
                 .textFieldStyle(.roundedBorder).disabled(model.busy)
             DatePicker("Starts", selection: $model.start, displayedComponents: [.date, .hourAndMinute])
                 .disabled(model.busy)
-            Text("\(TimeZone.current.identifier) · Uses Zoom’s current duration and meeting options. Creates immediately for the chosen time.")
+            Picker("Repeat", selection: $model.recurrence) {
+                ForEach(Recurrence.allCases) { rule in Text(rule.title).tag(rule) }
+            }.disabled(model.busy)
+            if model.recurrence != .none {
+                HStack {
+                    Stepper("Every \(model.repeatEvery) \(model.recurrence.intervalUnit)", value: $model.repeatEvery, in: 1...99)
+                        .frame(maxWidth: 240)
+                    Toggle("End on", isOn: $model.hasRepeatEnd)
+                    if model.hasRepeatEnd {
+                        DatePicker("Last date", selection: $model.repeatUntil, displayedComponents: .date).labelsHidden()
+                    }
+                }.disabled(model.busy)
+                Text(model.hasRepeatEnd ? "Inclusive end date in \(TimeZone.current.identifier)." : "Repeats with no end date, in \(TimeZone.current.identifier).")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Text("\(TimeZone.current.identifier) · Uses Zoom’s current duration and security options. Creates immediately for the chosen time.")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
                 Button(model.busy ? "Stop" : "Create meeting") {

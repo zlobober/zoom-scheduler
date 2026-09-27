@@ -1,11 +1,27 @@
 import Foundation
 
+/// Find a complete invitation, deduplicating AX values/titles and nested copies.
+/// Multiple distinct invitation bodies are rejected rather than choosing a meeting.
+func matchingInvitation(in texts: [String], topic: String) throws -> String? {
+    guard !topic.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+    let candidates = Set(texts.filter { text in
+        text.localizedCaseInsensitiveContains(topic) &&
+        text.range(of: #"https?://(?:[A-Za-z0-9-]+\.)*(?:zoom\.us|zoom\.com|zoomgov\.com|zoom\.com\.cn|zoom\.us\.cn)(?::\d+)?/[^\s]+"#, options: .regularExpression) != nil
+    })
+    guard let longest = candidates.max(by: { $0.count < $1.count }) else { return nil }
+    guard candidates.allSatisfy({ longest.contains($0) }) else {
+        throw AutomationFailure("Multiple invitation texts match this topic. Select the intended meeting in Zoom; nothing was copied.")
+    }
+    return longest
+}
+
 /// Reads Zoom's own calendar export, not Outlook's calendar database.
 struct CalendarInvitation {
     let topic: String
     let start: Date
     let uid: String
     let text: String
+    let recurrenceRule: String?
 
     static func parse(_ content: String) -> CalendarInvitation? {
         var lines: [String] = []
@@ -48,7 +64,7 @@ struct CalendarInvitation {
         guard let date = formatter.date(from: dt.value) else { return nil }
         let text = unescape(description.value)
         guard text.range(of: #"https?://[^\s]*zoom\.[^\s]+"#, options: .regularExpression) != nil else { return nil }
-        return CalendarInvitation(topic: unescape(summary.value), start: date, uid: uid.value, text: text)
+        return CalendarInvitation(topic: unescape(summary.value), start: date, uid: uid.value, text: text, recurrenceRule: fields["RRULE"]?.value)
     }
 
     static func unescape(_ value: String) -> String {
@@ -66,7 +82,8 @@ struct CalendarInvitation {
     }
 
     var message: String {
-        "Topic: \(topic)\nTime: \(start.formatted(date: .complete, time: .shortened)) (\(TimeZone.current.identifier))\n\n\(text)"
+        let repeatLine = recurrenceRule.map { "\nRepeat (iCalendar): \($0)" } ?? ""
+        return "Topic: \(topic)\nTime: \(start.formatted(date: .complete, time: .shortened)) (\(TimeZone.current.identifier))\(repeatLine)\n\n\(text)"
     }
 
     static func find(topic: String, start: Date? = nil, directory: URL? = nil) throws -> CalendarInvitation? {

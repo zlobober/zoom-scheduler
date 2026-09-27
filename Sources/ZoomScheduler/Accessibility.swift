@@ -207,6 +207,9 @@ final class ZoomAutomation {
         if try unique(dialog, names: ["Choose Date"], roles: [kAXGroupRole]) == nil {
             try input.press()
         }
+        // Zoom briefly reuses the previous calendar's AX nodes while rendering
+        // the new field's month; don't act on that stale snapshot.
+        try await pause()
         let picker = try await wait("date picker") {
             try self.unique(dialog, names: ["Choose Date"], roles: [kAXGroupRole])
         }
@@ -264,8 +267,111 @@ final class ZoomAutomation {
         return inputs
     }
 
-    func prepare(topic: String, start: Date, config: Configuration, durationMinutes: Int? = nil) async throws {
+    func selectOption(_ expected: String, control: AXNode, dialog: AXNode) async throws {
+        if normalized(control.value) == normalized(expected) { return }
+        try control.press()
+        let option = try await wait("option “\(expected)”") {
+            try self.unique(dialog, names: [expected], roles: [kAXStaticTextRole, kAXMenuItemRole], pressable: true)
+        }
+        try option.press()
+        _ = try await wait("selected option “\(expected)”", seconds: 4) {
+            normalized(control.value) == normalized(expected) ? control : nil
+        }
+        try await pause()
+    }
+
+    func recurrenceEnd(_ dialog: AXNode) throws -> AXNode {
+        let matches = dialog.walk().filter {
+            $0.role == kAXComboBoxRole && $0.enabled && $0.labels.contains { normalized($0).hasPrefix("recurrence end") }
+        }
+        guard matches.count == 1 else { throw AutomationFailure("Cannot identify Zoom's recurrence end selector. Nothing was submitted.") }
+        return matches[0]
+    }
+
+    func setRecurrence(_ recurrence: Recurrence, start: Date, dialog: AXNode, config: Configuration,
+                       every: Int = 1, until: Date? = nil) async throws {
+        try recurrence.validate(start: start, every: every, until: until)
+        let expected = recurrence.zoomLabel(start: start, config: config)
+        guard let repeatField = try field(dialog, ["Repeat"]) else {
+            throw AutomationFailure("Zoom's Repeat control is unavailable. Nothing was submitted.")
+        }
+        status("Setting recurrence: \(recurrence.title), interval \(every), until \(until.map(Recurrence.dateString) ?? "never")…")
+        // Seed the exact preset first: this establishes the correct weekday(s) or
+        // day-of-month instead of inheriting a previous custom rule.
+        try await selectOption(expected, control: repeatField, dialog: dialog)
+        guard every != 1 || until != nil else { return }
+        try await selectOption("Custom...", control: repeatField, dialog: dialog)
+        let interval = try await wait("\(recurrence.intervalControl) control") {
+            try self.unique(dialog, names: [recurrence.intervalControl], roles: [kAXIncrementorRole])
+        }
+        // AXIncrement/Decrement updates Zoom's model reliably; AXValue writes can
+        // target the wrong editor or change only the displayed text.
+        for _ in 0..<100 {
+            guard let current = (interval.attribute(kAXValueAttribute) as? NSNumber)?.intValue else {
+                throw AutomationFailure("Cannot read the recurrence interval. Nothing was submitted.")
+            }
+            if current == every { break }
+            let action = current < every ? kAXIncrementAction : kAXDecrementAction
+            guard AXUIElementPerformAction(interval.element, action as CFString) == .success else {
+                throw AutomationFailure("Cannot adjust recurrence interval. Nothing was submitted.")
+            }
+            _ = try await wait("recurrence interval change", seconds: 3) {
+                (interval.attribute(kAXValueAttribute) as? NSNumber)?.intValue != current ? interval : nil
+            }
+        }
+        let end = try recurrenceEnd(dialog)
+        try await selectOption(until == nil ? "Never" : "On...", control: end, dialog: dialog)
+        if let until {
+            let endDate = try await wait("End by date") { try self.field(dialog, ["End by date"]) }
+            try await selectDate(until, input: endDate, dialog: dialog, config: config)
+        }
+        try verifyRecurrence(recurrence, start: start, dialog: dialog, config: config, every: every, until: until)
+    }
+
+    func verifyRecurrence(_ recurrence: Recurrence, start: Date, dialog: AXNode, config: Configuration,
+                          every: Int = 1, until: Date? = nil) throws {
+        let custom = every != 1 || until != nil
+        let expected = custom ? "Custom..." : recurrence.zoomLabel(start: start, config: config)
+        guard let control = try field(dialog, ["Repeat"]), normalized(control.value) == normalized(expected) else {
+            throw AutomationFailure("Recurrence verification failed: expected “\(expected)”. Nothing was submitted.")
+        }
+        guard custom else { return }
+        guard let frequency = try field(dialog, ["Recurrence"]), frequency.value == recurrence.customFrequency,
+              let interval = try unique(dialog, names: [recurrence.intervalControl], roles: [kAXIncrementorRole]),
+              (interval.attribute(kAXValueAttribute) as? NSNumber)?.intValue == every else {
+            throw AutomationFailure("Custom recurrence frequency/interval verification failed. Nothing was submitted.")
+        }
+        if recurrence == .weekly || recurrence == .weekdays {
+            let weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            let chosen = recurrence == .weekdays ? Array(weekdays.prefix(5)) : [config.formatted(start, format: "EEEE")]
+            for day in weekdays {
+                let label = "Occurs on \(day),\(chosen.contains(day) ? "checked" : "not checked")"
+                guard try unique(dialog, names: [label], roles: [kAXButtonRole]) != nil else {
+                    throw AutomationFailure("Repeat weekday verification failed for \(day). Nothing was submitted.")
+                }
+            }
+        }
+        if recurrence == .monthly {
+            guard let byDate = try unique(dialog, names: ["On the Day of the month"], roles: [kAXRadioButtonRole]),
+                  (byDate.attribute(kAXValueAttribute) as? NSNumber)?.intValue == 1 else {
+                throw AutomationFailure("Monthly recurrence must use the same day of month. Nothing was submitted.")
+            }
+        }
+        let end = try recurrenceEnd(dialog)
+        guard end.value == (until == nil ? "Never" : "On...") else {
+            throw AutomationFailure("Recurrence end mode verification failed. Nothing was submitted.")
+        }
+        if let until {
+            let expectedDate = config.formatted(until, format: config.dateFormat)
+            guard let endDate = try field(dialog, ["End by date"]), normalized(endDate.value) == normalized(expectedDate) else {
+                throw AutomationFailure("Recurrence end date must be \(expectedDate). Nothing was submitted.")
+            }
+        }
+    }
+
+    func prepare(topic: String, start: Date, config: Configuration, durationMinutes: Int? = nil, recurrence: Recurrence = .none, repeatEvery: Int = 1, repeatUntil: Date? = nil) async throws {
         try validateMeeting(topic: topic, start: start)
+        try recurrence.validate(start: start, every: repeatEvery, until: repeatUntil)
         let root = try await openSchedule(config: config)
         let dialog = try await wait("scheduling form") { try self.form(root, config) }
         if let picker = try unique(dialog, names: ["Choose Date"], roles: [kAXGroupRole]) {
@@ -332,6 +438,8 @@ final class ZoomAutomation {
             _ = AXUIElementSetAttributeValue(topicField.element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
         }
         try await pause()
+        try await setRecurrence(recurrence, start: start, dialog: dialog, config: config, every: repeatEvery, until: repeatUntil)
+        try verifyRecurrence(recurrence, start: start, dialog: dialog, config: config, every: repeatEvery, until: repeatUntil)
         try verify(dialog, topic: topic, start: start, config: config, durationMinutes: durationMinutes)
         status("Topic, date, time\(durationMinutes == nil ? "" : ", and duration") filled and verified.")
     }
@@ -344,10 +452,67 @@ final class ZoomAutomation {
         }
     }
 
-    func create(topic: String, start: Date, config: Configuration, durationMinutes: Int? = nil) async throws -> String {
+    func disableCalendarImport(_ dialog: AXNode) async throws {
+        status("Selecting Other Calendars to prevent Outlook/Calendar import…")
+        guard let other = try unique(dialog, names: ["Other Calendars"], roles: [kAXRadioButtonRole]) else {
+            throw AutomationFailure("Cannot find Zoom's Other Calendars option. Stopping before Save to avoid opening an external calendar application.")
+        }
+        if (other.attribute(kAXValueAttribute) as? NSNumber)?.intValue != 1 {
+            try other.press()
+        }
+        _ = try await wait("Other Calendars to be selected", seconds: 4) {
+            (other.attribute(kAXValueAttribute) as? NSNumber)?.intValue == 1 ? other : nil
+        }
+        try await pause()
+    }
+
+    /// Other Calendars normally exposes the invitation in Zoom rather than an
+    /// external .ics import. Read only a complete topic-matched invitation body.
+    func visibleInvitation(_ root: AXNode, topic: String) throws -> String? {
+        let roles = [kAXTextAreaRole, kAXTextFieldRole, kAXStaticTextRole]
+        let texts = root.walk().filter { roles.contains($0.role) }.flatMap { [$0.value] + $0.labels }
+        return try matchingInvitation(in: texts, topic: topic)
+    }
+
+    func copyVisibleConfirmation(_ root: AXNode, topic: String, config: Configuration) async throws -> String? {
+        let windows = root.children.filter { $0.role == kAXWindowRole }
+        var buttons: [AXNode] = []
+        for window in windows {
+            guard window.matches(["Schedule Meeting", "Meeting scheduled", "Meeting Invitation", topic]) else { continue }
+            // Some versions render the topic separately from the invitation body.
+            // Scope Copy to a window containing that exact topic, never a global button.
+            guard window.walk().contains(where: { $0.matches([topic], includeValue: true) }) else { continue }
+            if let copy = try unique(window, names: config.copyInvitation + ["Copy to Clipboard"], pressable: true) {
+                buttons.append(copy)
+            }
+        }
+        guard buttons.count <= 1 else { throw AutomationFailure("Multiple invitation windows match this topic. Nothing was copied.") }
+        guard let copy = buttons.first else { return nil }
+        let clipboard = NSPasteboard.general
+        let previousCount = clipboard.changeCount
+        try copy.press()
+        let deadline = Date().addingTimeInterval(8)
+        repeat {
+            try await pause()
+            if clipboard.changeCount != previousCount, let text = clipboard.string(forType: .string) {
+                // Topic was verified separately in the source window. Preserve it
+                // as metadata for customized invitations which omit the topic.
+                let withTopic = text.localizedCaseInsensitiveContains(topic) ? text : "Topic: \(topic)\n\n\(text)"
+                guard let verified = try matchingInvitation(in: [withTopic], topic: topic) else {
+                    throw AutomationFailure("Zoom copied text without a valid Zoom invitation URL.")
+                }
+                return verified
+            }
+        } while Date() < deadline
+        throw AutomationFailure("Zoom's invitation Copy control did not update the clipboard. The meeting may already exist; do not recreate it.")
+    }
+
+    func create(topic: String, start: Date, config: Configuration, durationMinutes: Int? = nil, recurrence: Recurrence = .none, repeatEvery: Int = 1, repeatUntil: Date? = nil) async throws -> String {
         try validateMeeting(topic: topic, start: start)
         let root = try await connect(config)
         guard let dialog = try form(root, config) else { throw AutomationFailure("Open and fill Zoom’s scheduling form first.") }
+        try recurrence.validate(start: start, every: repeatEvery, until: repeatUntil)
+        try verifyRecurrence(recurrence, start: start, dialog: dialog, config: config, every: repeatEvery, until: repeatUntil)
         try verify(dialog, topic: topic, start: start, config: config, durationMinutes: durationMinutes)
         // Without an interactive review step, require an identifiable matching timezone.
         let zone = try field(dialog, ["Time zone", "Timezone"])
@@ -356,7 +521,11 @@ final class ZoomAutomation {
               zone.value.localizedCaseInsensitiveContains(city) || zone.value.localizedCaseInsensitiveContains(TimeZone.current.identifier) else {
             throw AutomationFailure("Zoom’s timezone could not be verified as \(TimeZone.current.identifier). Set that timezone in Zoom before retrying. Nothing was submitted.")
         }
-        status("Fields and timezone verified. Locating Save…")
+        try await disableCalendarImport(dialog)
+        // Re-check after changing the calendar option, in case Zoom re-rendered.
+        try verify(dialog, topic: topic, start: start, config: config, durationMinutes: durationMinutes)
+        try verifyRecurrence(recurrence, start: start, dialog: dialog, config: config, every: repeatEvery, until: repeatUntil)
+        status("Fields, timezone, and no-import calendar option verified. Locating Save…")
         guard let save = try unique(dialog, names: config.submitLabels, roles: [kAXButtonRole], pressable: true) else {
             throw AutomationFailure("Could not identify a unique Save/Schedule control. Nothing was submitted.")
         }
@@ -364,14 +533,32 @@ final class ZoomAutomation {
         onSubmissionAttempt()
         status("Submitting in Zoom… Do not submit again if invitation retrieval fails.")
         try save.press()
-        // Submission may open a calendar application; re-activate Zoom during retrieval.
+        // Wait for Zoom's confirmation/meeting details, not an external calendar.
         try await Task.sleep(for: .seconds(2))
-        return try await invitation(topic: topic, config: config, expectedStart: start)
+        return try await invitation(topic: topic, config: config, expectedStart: start, waitForConfirmation: true)
     }
 
-    func invitation(topic: String, config: Configuration, expectedStart: Date? = nil) async throws -> String {
+    func invitation(topic: String, config: Configuration, expectedStart: Date? = nil, waitForConfirmation: Bool = false) async throws -> String {
         status("Looking for the meeting’s invitation…")
         let root = try await connect(config)
+        // Newly saved meetings can take a few seconds to render their invitation.
+        let deadline = Date().addingTimeInterval(waitForConfirmation ? 10 : 0)
+        repeat {
+            if try form(root, config) == nil {
+                let direct = try visibleInvitation(root, topic: topic)
+                let text: String?
+                if let direct { text = direct }
+                else { text = try await copyVisibleConfirmation(root, topic: topic, config: config) }
+                if let text {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(text, forType: .string)
+                    status("Invitation retrieved directly from Zoom. No external calendar import.")
+                    return text
+                }
+            }
+            if Date() >= deadline { break }
+            try await pause()
+        } while true
         guard try form(root, config) == nil else {
             throw AutomationFailure("Zoom’s scheduling/editing form is still open. Invitation retrieval only works for a saved meeting. For a new meeting, use Create meeting. If you already attempted submission, check Zoom for errors or an existing meeting before retrying. Invitation-only retrieval did not save anything.")
         }

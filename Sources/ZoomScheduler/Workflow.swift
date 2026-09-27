@@ -18,7 +18,7 @@ final class Workflow {
         return Configuration()
     }
 
-    func run(topic: String, start: Date?, config: Configuration, invitationOnly: Bool = false, durationMinutes: Int? = nil) async throws -> String {
+    func run(topic: String, start: Date?, config: Configuration, invitationOnly: Bool = false, durationMinutes: Int? = nil, recurrence: Recurrence = .none, repeatEvery: Int = 1, repeatUntil: Date? = nil) async throws -> String {
         // Prevent two scheduler processes from manipulating the same Zoom UI.
         let directory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Zoom Scheduler")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -29,29 +29,50 @@ final class Workflow {
             throw AutomationFailure("Another Zoom Scheduler operation is running.")
         }
         defer { flock(fd, LOCK_UN); close(fd) }
+        let previousApp = NSWorkspace.shared.frontmostApplication
+        defer {
+            if let previousApp, !previousApp.isTerminated,
+               NSWorkspace.shared.frontmostApplication?.processIdentifier != previousApp.processIdentifier {
+                log("Restoring focus to \(previousApp.localizedName ?? "the previous app")…")
+                if !previousApp.activate() { log("Could not restore the previous app's focus.") }
+            }
+        }
 
         automation.status = { [weak self] in self?.log($0) }
         guard !topic.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw AutomationFailure("Enter a meeting topic.") }
         let key = start.map { "\(topic)|\(Int($0.timeIntervalSince1970 / 60))" }
         Self.preferences.synchronize()
         let attempts = Self.preferences.stringArray(forKey: "submissionAttempts") ?? []
+        if !invitationOnly, let key, attempts.contains(key) {
+            let rules = Self.preferences.dictionary(forKey: "submissionRecurrences") as? [String: String] ?? [:]
+            guard (rules[key] ?? Recurrence.none.rawValue) == recurrence.requestID(every: repeatEvery, until: repeatUntil) else {
+                throw AutomationFailure("Submission was already attempted for this topic/time with a different repeat rule. It will not be changed or recreated. Check Zoom and use a unique topic for a new series.")
+            }
+        }
         if invitationOnly || key.map({ attempts.contains($0) }) == true {
             log("Retrieving the existing invitation only; not creating another meeting.")
             return try await automation.invitation(topic: topic, config: config, expectedStart: start)
         }
         guard let start, let key else { throw AutomationFailure("A start time is required to create a meeting.") }
         try validateMeeting(topic: topic, start: start)
+        try recurrence.validate(start: start, every: repeatEvery, until: repeatUntil)
         automation.onSubmissionAttempt = {
             var saved = Self.preferences.stringArray(forKey: "submissionAttempts") ?? []
             saved.append(key)
-            Self.preferences.set(Array(saved.suffix(500)), forKey: "submissionAttempts")
+            let retained = Array(saved.suffix(500))
+            Self.preferences.set(retained, forKey: "submissionAttempts")
+            var rules = Self.preferences.dictionary(forKey: "submissionRecurrences") as? [String: String] ?? [:]
+            rules[key] = recurrence.requestID(every: repeatEvery, until: repeatUntil)
+            rules = rules.filter { retained.contains($0.key) }
+            Self.preferences.set(rules, forKey: "submissionRecurrences")
             Self.preferences.synchronize()
         }
         log("Creating “\(topic)” for \(start.formatted()) (\(TimeZone.current.identifier)).")
-        if let durationMinutes { log("Duration: \(durationMinutes) minutes. Zoom’s security, recurrence, and calendar settings will be retained.") }
-        else { log("Zoom’s duration, security, recurrence, and calendar settings will be retained.") }
-        try await automation.prepare(topic: topic, start: start, config: config, durationMinutes: durationMinutes)
+        log("Repeat: \(recurrence.title), interval \(repeatEvery); end \(repeatUntil.map(Recurrence.dateString) ?? "never").")
+        if let durationMinutes { log("Duration: \(durationMinutes) minutes. Zoom’s security settings will be retained; external calendar import is disabled.") }
+        else { log("Zoom’s duration and security settings will be retained; external calendar import is disabled.") }
+        try await automation.prepare(topic: topic, start: start, config: config, durationMinutes: durationMinutes, recurrence: recurrence, repeatEvery: repeatEvery, repeatUntil: repeatUntil)
         try Task.checkCancellation()
-        return try await automation.create(topic: topic, start: start, config: config, durationMinutes: durationMinutes)
+        return try await automation.create(topic: topic, start: start, config: config, durationMinutes: durationMinutes, recurrence: recurrence, repeatEvery: repeatEvery, repeatUntil: repeatUntil)
     }
 }
