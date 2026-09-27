@@ -1,0 +1,20 @@
+# Build products and local IDE state
+.build/
+dist/
+.swiftpm/
+.DS_Store
+
+# Private meeting data and diagnostic output
+invitation*.txt
+*.ics
+*.log
+zoom-accessibility*.txt
+diagnostics*.txt
+
+# Local credentials/configuration
+.env
+.env.*
+*.pem
+*.key
+config.json
+config.local.json
